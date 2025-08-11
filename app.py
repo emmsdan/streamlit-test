@@ -20,6 +20,7 @@ from datetime import datetime
 LOG_PATH = "failure_log.csv"
 
 GENERIC_TOKENS = {"pain", "ache", "aches", "soreness", "discomfort"}
+GENERIC_SYNONYMS = {"pain", "ache", "aches", "soreness", "discomfort", "tenderness"}
 
 def log_failure(record: dict):
     file_exists = os.path.isfile(LOG_PATH)
@@ -520,6 +521,14 @@ def symptom_free_input_page():
                               ]
             user_stems = list(set(user_stems))
 
+            # --- NEW: separate generics and anchors ---
+            user_generics = {t for t in user_tokens if t in GENERIC_TOKENS}
+            user_anchors  = [t for t in user_tokens if t not in GENERIC_TOKENS]
+
+            # --- NEW: detect & store generic-only query (no anchors present) ---
+            generic_only = bool(user_generics) and not user_anchors
+            st.session_state.user_data["generic_only"] = generic_only
+
             matches   = set()
             threshold = 0.65
 
@@ -532,65 +541,73 @@ def symptom_free_input_page():
                         continue
 
                     
-                    # split into words ≥3 letters and stem each
-                    sym_tokens = re.findall(r"[A-Za-z]{3,}", sym_clean)
-                                                  # generate stems + alternate i<->y forms for dizzy↔dizzi
-                    sym_stems = [stem(tok) for tok in sym_tokens]
-                    sym_stems += [
-                                                           s[:-1] + ("y" if s.endswith("i") else "i")
-                                                           for s in sym_stems
-                                                          if s.endswith(("i","y"))
-                                                  ]
-                    sym_stems = list(set(sym_stems))
+                    # --- NEW matching logic with anchor-first gate ---
+                    phrase_tokens = re.findall(r"[A-Za-z]{3,}", sym_clean)
+                    phrase_stems  = [stem(t) for t in phrase_tokens]
+                    phrase_set    = set(phrase_tokens)
+                    phrase_stem_set = set(phrase_stems)
 
-                    # Remove generic stems for fallback matching
-                    generic_stems = {stem(t) for t in GENERIC_TOKENS}
-                    filtered_user_tokens = [t for t in user_tokens if t not in GENERIC_TOKENS]
-                    filtered_user_stems  = [s for s in user_stems if s not in generic_stems]
-
-
-                    # a) substring match: require either a specific token, or generic+specific together
-                    has_specific = any(tok in sym_clean for tok in filtered_user_tokens)
-                    has_generic  = any(tok in sym_clean for tok in GENERIC_TOKENS)
-                    user_used_generic = any(t in GENERIC_TOKENS for t in user_tokens)
-
-                    if user_used_generic and filtered_user_tokens:
-                        # Require BOTH specific and generic in the same phrase (e.g., 'back' + 'pain')
-                        if has_specific and has_generic:
-                            matches.add(idx)
-                            break
+                    # 1) Anchor-first gate (unless user gave no anchors)
+                    has_anchor_overlap = False
+                    if user_anchors:
+                        ua_stems = {stem(t) for t in user_anchors}
+                        has_anchor_overlap = bool(
+                            (set(user_anchors) & phrase_set) or (ua_stems & phrase_stem_set)
+                        )
                     else:
-                        # If user didn’t type a generic, allow matching on specifics alone.
-                        # If the user typed ONLY a generic (e.g., "pain"), still allow that generic match.
-                        if has_specific or (not filtered_user_tokens and has_generic):
-                            matches.add(idx)
+                        has_anchor_overlap = True  # allow if no anchors provided
+
+                    if not has_anchor_overlap:
+                        continue  # skip this phrase entirely
+
+                    # 2) Generic+specific coherence (if user included generic + anchor)
+                    has_any_generic_here = bool(phrase_set & GENERIC_SYNONYMS)
+
+                    # --- NEW: for generic-only queries, require a generic actually present in the phrase ---
+                    if generic_only and not has_any_generic_here:
+                        continue
+
+                    if user_generics and user_anchors and not has_any_generic_here:
+                        continue  # needs a generic synonym in the phrase if user typed generic+anchor
+
+                    # 3) Scoring (precision > recall)
+                    score = 0.0
+
+                    # exact phrase hit
+                    for raw_s in re.split(r"[,;]", str(row["Symptoms"])):
+                        if normalize_free_text(raw_s.strip().lower()) == sym_clean:
+                            score += 3.0
                             break
 
-                    # b) exact stem match: require generic co-occurrence if user typed a generic+specific
-                    if user_used_generic and filtered_user_tokens and not has_generic:
-                        pass  # skip this phrase; no generic here
-                    elif any(us == ds for us in filtered_user_stems for ds in sym_stems):
-                        matches.add(idx)
-                        break
+                    # exact token overlap (non-generic)
+                    if set(user_anchors) & phrase_set:
+                        score += 2.0
 
-                    # c) fuzzy-stem match across token pairs (safer)
+                    # stem overlap
+                    ua_stems = {stem(t) for t in user_anchors}
+                    if ua_stems & phrase_stem_set:
+                        score += 1.5
+
+                    # controlled fuzzy (only after anchor gate)
                     def ok_pair(us, ds):
-                        # ignore very short tokens for fuzzy; exact/substring were checked earlier
                         if len(us) < 4 or len(ds) < 4:
                             return False
-                        # avoid heart≈ear/hurt: require same first letter OR substring relation
-                        if not (us[0] == ds[0] or us in ds or ds in us):
-                            return False
-                        # tighter similarity threshold
-                        return SequenceMatcher(None, us, ds).ratio() >= 0.80
+                        return (us in ds) or (ds in us) or (SequenceMatcher(None, us, ds).ratio() >= 0.90)
 
-                    # keep your co-occurrence guard: if user typed a generic+specific but this phrase
-                    # lacks the generic term, don't allow fuzzy to pull it in
-                    if user_used_generic and filtered_user_tokens and not has_generic:
-                        pass
-                    elif any(ok_pair(us, ds) for us in filtered_user_stems for ds in sym_stems):
+                    
+                    # --- NEW: disable fuzzy for generic-only queries (prevents leakage) ---
+                    if (not generic_only) and any(ok_pair(stem(u), stem(p)) for u in user_anchors for p in phrase_tokens):
+                        score += 1.0
+
+                    # generic coherence bonus
+                    if user_generics and has_any_generic_here:
+                        score += 0.5
+
+                    # keep only meaningful matches
+                    if score >= 2.0:
                         matches.add(idx)
                         break
+
 
                 # end raw_sym loop
                 # if we matched this row, stop checking it
@@ -649,6 +666,15 @@ def symptom_primary_category_freeinput_page():
     current_gender = st.session_state.user_data.get('gender')
     current_age    = st.session_state.user_data.get('age')
 
+    # --- STRICT dominance filter for generic-only queries ---
+    generic_only = bool(st.session_state.user_data.get("generic_only"))
+    if generic_only and not subset.empty:
+        counts = subset["Primary Category"].value_counts()
+        TOP_N = 2  # set to 2 if you want at most two categories
+        keep = counts.head(TOP_N).index
+        subset = subset[subset["Primary Category"].isin(keep)]
+
+
     # Hide Pediatrics for ages 15+
     primaries = [
         cat for cat in sorted(subset["Primary Category"].dropna().unique())
@@ -659,6 +685,14 @@ def symptom_primary_category_freeinput_page():
             and is_gender_allowed(cat, current_gender, suppress_error=True)
         )
     ]
+
+    if not primaries:
+        st.warning("We found matches, but none are available for your selected gender/age.")
+        if st.button("← Back"):
+            st.session_state.page = "symptom_free_input"
+            st.rerun()
+        return
+
     choice = display_grid(primaries, cols=2)
     if choice:
         st.session_state.user_data['primary_category'] = choice
