@@ -1118,7 +1118,6 @@ def results_page():
             "</div>"
         )
 
-
         # Optional referral line below the card
         ref_text = (condition.get("Referral", "") or "").strip()
         if ref_text:
